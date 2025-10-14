@@ -14,6 +14,7 @@ pillow==9.5.0
 psutil
 py-tgcalls==0.9.7
 pytgcrypto
+pyrogram==2.0.106
 kurigram
 python-dotenv
 pyyaml
@@ -25,3 +26,4 @@ uvloop; sys_platform != "win32"
 yt-dlp
 youtube-search
 youtube-search-python
+
