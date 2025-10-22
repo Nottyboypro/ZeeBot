@@ -31,8 +31,8 @@ async def get_stream_url(query, video=False):
     Updated function to use our integrated YouTube API with Telegram caching
     """
     # Our FastAPI server URL (update this to your deployment URL when needed)
-    api_base ="http://195.26.255.16:8000"
-    api_key = "HlzXk3eTV9Ni6M1_Nm1VHEhHVbxobJ6ingFzW4JBCkU"
+    api_base ="https://ytapii-d8f813759c73.herokuapp.com"
+    api_key = "f94ef3abca9c1fe5fbc8f8848d6fdf5026a97fefb660b0e3c24918237ae4d5ae"
     
     # Choose endpoint based on video parameter
     endpoint = "/ytmp4" if video else "/ytmp3"
