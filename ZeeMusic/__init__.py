@@ -1,3 +1,11 @@
+# --- add these lines at the very top ---
+import asyncio
+try:
+    asyncio.get_running_loop()
+except RuntimeError:
+    asyncio.set_event_loop(asyncio.new_event_loop())
+# --- end add ---
+
 from ZeeMusic.core.bot import Zee
 from ZeeMusic.core.dir import dirr
 from ZeeMusic.core.git import git
@@ -13,7 +21,6 @@ heroku()
 
 app = Zee()
 userbot = Userbot()
-
 
 from .platforms import *
 
