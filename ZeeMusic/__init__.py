@@ -11,7 +11,7 @@ git()
 dbb()
 heroku()
 
-app = Loy()
+app = Zee()
 userbot = Userbot()
 
 
@@ -24,3 +24,4 @@ Spotify = SpotifyAPI()
 Resso = RessoAPI()
 Telegram = TeleAPI()
 YouTube = YouTubeAPI()
+
