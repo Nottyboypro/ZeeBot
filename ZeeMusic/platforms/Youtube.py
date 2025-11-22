@@ -16,7 +16,6 @@ import random
 import logging
 import aiohttp
 import config
-from config import API_URL, VIDEO_API_URL, API_KEY
 
 
 def cookie_txt_file():
@@ -30,130 +29,148 @@ def cookie_txt_file():
     return cookie_file
 
 
+
+API_URL = "http://82.180.147.88:5000"
+API_KEY = "NOTTYBOY_1d194d5fa96614b8cdbcd1fcee1551378afed30144f517bfd0c5aadc8455a489"
+
+def _extract_video_id(link: str) -> str:
+    """Try to extract YouTube video id from a URL or return the value if already an id."""
+    if "v=" in link:
+        return link.split('v=')[-1].split('&')[0]
+    if "youtu.be/" in link:
+        return link.split("youtu.be/")[-1].split('?')[0].split('&')[0]
+    # fallback: maybe user passed id directly
+    return link.split('&')[0].split('?')[0]
+
+async def _download_file(session: aiohttp.ClientSession, download_url: str, dest_path: str):
+    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+    try:
+        async with session.get(download_url) as file_response:
+            if file_response.status != 200:
+                raise Exception(f"File download failed with status {file_response.status}")
+            with open(dest_path, 'wb') as f:
+                while True:
+                    chunk = await file_response.content.read(8192)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+        return dest_path
+    except aiohttp.ClientError as e:
+        print(f"[DOWNLOAD ERROR] Network/client error: {e}")
+        return None
+    except Exception as e:
+        print(f"[DOWNLOAD ERROR] {e}")
+        return None
+
 async def download_song(link: str):
-    video_id = link.split('v=')[-1].split('&')[0]
+    """
+    Uses: GET {API_URL}/ytmp3?q=<video_id_or_url>&key=<API_KEY>
+    Expects JSON with 'download_url' (or 'link'), 'video_id', optionally 'time_sec'
+    """
+    video_id = _extract_video_id(link)
 
     download_folder = "downloads"
     for ext in ["mp3", "m4a", "webm"]:
-        file_path = f"{download_folder}/{video_id}.{ext}"
+        file_path = os.path.join(download_folder, f"{video_id}.{ext}")
         if os.path.exists(file_path):
-            #print(f"File already exists: {file_path}")
             return file_path
-        
-    song_url = f"{API_URL}/song/{video_id}?api={API_KEY}"
+
+    endpoint = f"{API_URL}/ytmp3"
+    params = {"q": video_id, "key": API_KEY}
+
     async with aiohttp.ClientSession() as session:
-        for attempt in range(10):
+        # small number of retries — audio endpoint likely returns immediately with download_url
+        for attempt in range(1, 6):
             try:
-                async with session.get(song_url) as response:
-                    if response.status != 200:
-                        raise Exception(f"API request failed with status code {response.status}")
-                
-                    data = await response.json()
-                    status = data.get("status", "").lower()
-
-                    if status == "done":
-                        download_url = data.get("link")
-                        if not download_url:
-                            raise Exception("API response did not provide a download URL.")
-                        break
-                    elif status == "downloading":
-                        await asyncio.sleep(4)
-                    else:
-                        error_msg = data.get("error") or data.get("message") or f"Unexpected status '{status}'"
-                        raise Exception(f"API error: {error_msg}")
+                async with session.get(endpoint, params=params) as resp:
+                    if resp.status != 200:
+                        text = await resp.text()
+                        raise Exception(f"API request failed (status {resp.status}): {text[:200]}")
+                    data = await resp.json()
             except Exception as e:
-                print(f"[FAIL] {e}")
+                print(f"[FAIL attempt {attempt}] {e}")
+                if attempt < 5:
+                    await asyncio.sleep(2)
+                    continue
                 return None
-        else:
-            print("⏱️ Max retries reached. Still downloading...")
-            return None
-    
 
-        try:
-            file_format = data.get("format", "mp3")
-            file_extension = file_format.lower()
-            file_name = f"{video_id}.{file_extension}"
-            download_folder = "downloads"
-            os.makedirs(download_folder, exist_ok=True)
-            file_path = os.path.join(download_folder, file_name)
+            # prefer keys: download_url or link
+            download_url = data.get("download_url") or data.get("link")
+            if download_url:
+                # decide extension: prefer format field if present, else default to mp3
+                file_format = data.get("format") or "mp3"
+                file_extension = file_format.lower().split("/")[-1].replace("audio/", "")
+                if file_extension not in ("mp3", "m4a", "webm"):
+                    # normalize unknown -> mp3
+                    file_extension = "mp3"
+                file_name = f"{video_id}.{file_extension}"
+                file_path = os.path.join(download_folder, file_name)
+                result = await _download_file(session, download_url, file_path)
+                return result
+            else:
+                # maybe API returns an error or is still processing
+                err = data.get("error") or data.get("message")
+                if err:
+                    print(f"[API ERROR] {err}")
+                    return None
+                # if no download_url and no explicit error, wait a bit and retry
+                print(f"[INFO] No download_url yet (attempt {attempt}). Retrying...")
+                await asyncio.sleep(3)
 
-            async with session.get(download_url) as file_response:
-                with open(file_path, 'wb') as f:
-                    while True:
-                        chunk = await file_response.content.read(8192)
-                        if not chunk:
-                            break
-                        f.write(chunk)
-                return file_path
-        except aiohttp.ClientError as e:
-            print(f"Network or client error occurred while downloading: {e}")
-            return None
-        except Exception as e:
-            print(f"Error occurred while downloading song: {e}")
-            return None
-    return None
+        print("⏱️ Max retries reached for ytmp3.")
+        return None
 
 async def download_video(link: str):
-    video_id = link.split('v=')[-1].split('&')[0]
+    """
+    Uses: GET {API_URL}/ytmp4?q=<video_id_or_url>&key=<API_KEY>
+    Expects JSON with 'download_url' (or 'link') and optionally 'video_id' / 'format'
+    """
+    video_id = _extract_video_id(link)
 
     download_folder = "downloads"
     for ext in ["mp4", "webm", "mkv"]:
-        file_path = f"{download_folder}/{video_id}.{ext}"
+        file_path = os.path.join(download_folder, f"{video_id}.{ext}")
         if os.path.exists(file_path):
             return file_path
-        
-    video_url = f"{VIDEO_API_URL}/video/{video_id}?api={API_KEY}"
+
+    endpoint = f"{API_URL}/ytmp4"
+    params = {"q": video_id, "key": API_KEY}
+
     async with aiohttp.ClientSession() as session:
-        for attempt in range(10):
+        for attempt in range(1, 6):
             try:
-                async with session.get(video_url) as response:
-                    if response.status != 200:
-                        raise Exception(f"API request failed with status code {response.status}")
-                
-                    data = await response.json()
-                    status = data.get("status", "").lower()
-
-                    if status == "done":
-                        download_url = data.get("link")
-                        if not download_url:
-                            raise Exception("API response did not provide a download URL.")
-                        break
-                    elif status == "downloading":
-                        await asyncio.sleep(8)
-                    else:
-                        error_msg = data.get("error") or data.get("message") or f"Unexpected status '{status}'"
-                        raise Exception(f"API error: {error_msg}")
+                async with session.get(endpoint, params=params) as resp:
+                    if resp.status != 200:
+                        text = await resp.text()
+                        raise Exception(f"API request failed (status {resp.status}): {text[:200]}")
+                    data = await resp.json()
             except Exception as e:
-                print(f"[FAIL] {e}")
+                print(f"[FAIL attempt {attempt}] {e}")
+                if attempt < 5:
+                    await asyncio.sleep(3)
+                    continue
                 return None
-        else:
-            print("⏱️ Max retries reached. Still downloading...")
-            return None
-    
 
-        try:
-            file_format = data.get("format", "mp4")
-            file_extension = file_format.lower()
-            file_name = f"{video_id}.{file_extension}"
-            download_folder = "downloads"
-            os.makedirs(download_folder, exist_ok=True)
-            file_path = os.path.join(download_folder, file_name)
+            download_url = data.get("download_url") or data.get("link")
+            if download_url:
+                file_format = data.get("format") or "mp4"
+                file_extension = file_format.lower().split("/")[-1].replace("video/", "")
+                if file_extension not in ("mp4", "webm", "mkv"):
+                    file_extension = "mp4"
+                file_name = f"{video_id}.{file_extension}"
+                file_path = os.path.join(download_folder, file_name)
+                result = await _download_file(session, download_url, file_path)
+                return result
+            else:
+                err = data.get("error") or data.get("message")
+                if err:
+                    print(f"[API ERROR] {err}")
+                    return None
+                print(f"[INFO] No download_url yet for video (attempt {attempt}). Retrying...")
+                await asyncio.sleep(4)
 
-            async with session.get(download_url) as file_response:
-                with open(file_path, 'wb') as f:
-                    while True:
-                        chunk = await file_response.content.read(8192)
-                        if not chunk:
-                            break
-                        f.write(chunk)
-                return file_path
-        except aiohttp.ClientError as e:
-            print(f"Network or client error occurred while downloading: {e}")
-            return None
-        except Exception as e:
-            print(f"Error occurred while downloading video: {e}")
-            return None
-    return None
+        print("⏱️ Max retries reached for ytmp4.")
+        return None
 
 async def check_file_size(link):
     async def get_format_info(link):
@@ -596,3 +613,4 @@ class YouTubeAPI:
             direct = True
             downloaded_file = await download_song(link)
         return downloaded_file, direct
+
