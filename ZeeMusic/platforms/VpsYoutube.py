@@ -1,4 +1,7 @@
 import asyncio, httpx, os, re, yt_dlp
+import aiofiles
+import aiohttp
+from urllib.parse import urlparse, parse_qs
 
 from typing import Union
 from pyrogram.types import Message
@@ -25,33 +28,176 @@ async def shell_cmd(cmd):
             return errorz.decode("utf-8")
     return out.decode("utf-8")
 
+DOWNLOAD_DIR = "downloads"
+API_BASE = "http://82.180.147.88:5000"
+API_KEY = "NOTTYBOY_1d194d5fa96614b8cdbcd1fcee1551378afed30144f517bfd0c5aadc8455a489"
+API_ENDPOINT = "/ytmp3"  # or /ytmp4 if you want video
 
-async def get_stream_url(query, video=False):
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+
+def extract_youtube_id(query: str) -> str:
     """
-    Updated function to use our integrated YouTube API with Telegram caching
+    Try to extract a youtube id from a url or return the input (if it already is an id).
     """
-    # Our FastAPI server URL (update this to your deployment URL when needed)
-    api_base ="https://ytapii-d8f813759c73.herokuapp.com"
-    api_key = "f94ef3abca9c1fe5fbc8f8848d6fdf5026a97fefb660b0e3c24918237ae4d5ae"
-    
-    # Choose endpoint based on video parameter
-    endpoint = "/ytmp4" if video else "/ytmp3"
-    api_url = f"{api_base}{endpoint}"
-    
-    async with httpx.AsyncClient(timeout=120) as client:
-        params = {"url": query, "api_key": api_key}
+    # common youtube patterns
+    if "youtu" in query:
+        parsed = urlparse(query)
+        # youtu.be/<id>
+        if parsed.netloc.endswith("youtu.be"):
+            return parsed.path.strip("/")
+        # youtube.com/watch?v=...
+        qs = parse_qs(parsed.query)
+        if "v" in qs:
+            return qs["v"][0]
+        # /shorts/<id> or /watch/<id>
+        m = re.search(r"/(shorts|watch)/([A-Za-z0-9_-]{8,})", parsed.path)
+        if m:
+            return m.group(2)
+    # fallback: assume the query passed is an id already
+    return query.strip()
+
+
+async def _download_and_cache(download_url: str, local_path: str, timeout: int = 180):
+    """
+    Background downloader: writes to local_path.part then renames to local_path.
+    Skips if file already exists and size > 20KB.
+    """
+    part_path = local_path + ".part"
+    try:
+        # quick exist check
+        if os.path.exists(local_path) and os.path.getsize(local_path) > 20_000:
+            # already cached
+            return local_path
+
+        # if a partial exists but is small, remove it (or we could resume)
+        if os.path.exists(part_path) and os.path.getsize(part_path) < 1024:
+            try:
+                os.remove(part_path)
+            except Exception:
+                pass
+
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as session:
+            async with session.get(download_url) as resp:
+                if resp.status != 200:
+                    # download failed
+                    return None
+                # stream to disk
+                async with aiofiles.open(part_path, "wb") as f:
+                    async for chunk in resp.content.iter_chunked(64 * 1024):
+                        if not chunk:
+                            break
+                        await f.write(chunk)
+
+        # move/rename atomically
         try:
-            response = await client.get(api_url, params=params)
-            if response.status_code != 200:
-                return ""
-            
-            data = response.json()
-            if data.get("status") and data.get("result"):
-                return data["result"]["url"]
-            return ""
-        except Exception as e:
-            print(f"Error calling YouTube API: {e}")
-            return ""
+            os.replace(part_path, local_path)
+        except Exception:
+            # fallback copy
+            import shutil
+            shutil.move(part_path, local_path)
+
+        # final size check
+        if os.path.exists(local_path) and os.path.getsize(local_path) > 20_000:
+            return local_path
+        else:
+            # corrupted/small file
+            try:
+                os.remove(local_path)
+            except Exception:
+                pass
+            return None
+
+    except Exception as e:
+        # cleanup partial
+        try:
+            if os.path.exists(part_path):
+                os.remove(part_path)
+        except Exception:
+            pass
+        return None
+
+
+async def get_stream_source(query: str, *, api_base: str = API_BASE, api_key: str = API_KEY, use_video: bool = False):
+    """
+    Main helper for bot streaming.
+
+    Returns a dict:
+      - {'type': 'file', 'path': '/full/path/to/file.mp3'}  # use local file for streaming
+      - {'type': 'url', 'url': 'http://...download...?key=...'}  # use direct URL for instant stream
+
+    Behavior:
+      - If cache exists -> returns 'file'
+      - Else -> calls API, obtains download_url, immediately spawns background caching task
+                and returns {'type':'url', 'url': download_url} so you can start streaming instantly.
+    """
+    # normalize and pick filename
+    video_id = extract_youtube_id(query)
+    # safe filename
+    filename = f"{video_id}.mp3" if not use_video else f"{video_id}.mp4"
+    local_path = os.path.join(DOWNLOAD_DIR, filename)
+
+    # 1) cache check
+    try:
+        if os.path.exists(local_path) and os.path.getsize(local_path) > 20_000:
+            # cached; return local file path immediately
+            return {"type": "file", "path": os.path.abspath(local_path)}
+    except Exception:
+        pass
+
+    # 2) not cached -> call API to get download_url
+    endpoint = "/ytmp4" if use_video else "/ytmp3"
+    api_url = f"{api_base.rstrip('/')}{endpoint}"
+    params = {"q": query, "key": api_key}
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(api_url, params=params)
+            if resp.status_code != 200:
+                # log and return None (bot can handle)
+                return None
+            data = resp.json()
+    except Exception:
+        return None
+
+    # Expecting API response like: {"code":"SUCCESS", "download_url":"http://..."}
+    download_url = data.get("download_url") or data.get("downloadUrl") or data.get("url")
+    if not download_url:
+        return None
+
+    # start background caching (do not await)
+    # use a unique local_path based on filename; if API provides filename, you can prefer that.
+    bg_task = asyncio.create_task(_download_and_cache(download_url, local_path))
+    # (optional) attach a done callback to log errors
+    def _on_done(t):
+        try:
+            res = t.result()
+            # you can add logging here: print("Cache result:", res)
+        except Exception:
+            pass
+
+    bg_task.add_done_callback(_on_done)
+
+    # return the direct URL for instant streaming
+    return {"type": "url", "url": download_url}
+
+
+# ----------------------------
+# Usage example (pseudo)
+# ----------------------------
+# Suppose you use pytgcalls (or any library that accepts a URL or file path as source):
+#
+# src = await get_stream_source("https://youtu.be/abcd1234")
+# if src is None:
+#     # handle error (e.g., send message "Failed to fetch")
+# elif src["type"] == "file":
+#     # play local file
+#     await pytgcalls.play_local(peer, src["path"])
+# elif src["type"] == "url":
+#     # play the remote url directly (instant)
+#     await pytgcalls.play_stream(peer, src["url"])
+#
+# The background task will cache the file into downloads/<videoid>.mp3 for later reuse.
 
 
 class YouTubeAPI:
